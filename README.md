@@ -10,7 +10,7 @@ Deterministic rules assign a status which is one of "pass", "pass with caution",
 
 flowchart TD
   S([START]) --> CI["check_image<br/>quality, lesion + artefact masks"]
-  CI -- ok --> CL["classify<br/>ViT, calibration, OOD energy"]
+  CI -- ok --> CL["classify<br/>ViT, calibration, OOD detection"]
   CI -- "bad image" --> WR
   CL -- "OOD: abstain" --> WR
 
