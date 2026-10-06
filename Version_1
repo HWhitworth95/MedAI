@@ -1,1 +1,276 @@
+import asyncio
+import datetime
+import operator
+from typing import Annotated, List, Literal, Optional, Union
+from typing_extensions import TypedDict
+
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import kagglehub
+import timm
+import optuna
+import torch.optim as optim
+
+import numpy as np
+import optuna
+import timm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader
+
+mport numpy as np
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+
+import kagglehub
+
+# Download latest version
+path = kagglehub.dataset_download("paultimothymooney/chest-xray-pneumonia")
+
+print("Path to dataset files:", path)
+
+base_dir = os.path.join(path, "chest_xray")
+
+from torchvision import transforms
+
+# Training transforms: Mild rotation, mild scale/crop
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomRotation(degrees=7),                 # Modest tilt is safe
+    transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),   # Mild zoom variance
+    transforms.ColorJitter(brightness=0.1, contrast=0.1), # Simulates jitter
+    transforms.Lambda(lambda img: img.convert("RGB")),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Validation/Test transforms: Strict, deterministic resizing
+eval_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.Lambda(lambda img: img.convert("RGB")),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+
+
+train_dataset = datasets.ImageFolder(root=os.path.join(base_dir, "train"), transform=train_transform)
+val_dataset = datasets.ImageFolder(root=os.path.join(base_dir, "val"), transform=eval_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(base_dir, "test"), transform=eval_transform)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=2)
+model = model.to(device)
+print(f"Model successfully loaded on {device}!")
+
+#MAKE SURE OPTUNA IS INSTALLED
+
+def objective(trial):
+    # Hyperparameters to search
+    lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+    weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
+    batch_size = trial.suggest_categorical("batch_size", [8, 16, 32, 64])
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, drop_last=True
+    )
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    model = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=2)
+    model = model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    epochs = 3
+    for epoch in range(epochs):
+        # --- Training Phase ---
+        model.train()
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+        # --- Validation Phase ---
+        model.eval()
+        all_targets = []
+        all_probs = []
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+
+                # Convert logits to probabilities and grab positive class (index 1)
+                probs = torch.softmax(outputs, dim=1)[:, 1]
+
+                all_probs.extend(probs.detach().cpu().numpy())
+                all_targets.extend(labels.detach().cpu().numpy())
+
+        # Ensure both classes are present in the validation set before computing AUC
+        if len(np.unique(all_targets)) > 1:
+            val_auroc = roc_auc_score(all_targets, all_probs)
+        else:
+            val_auroc = 0.5  # Fallback baseline if a batch or split lacks one class
+
+        # Optuna pruning checkpoint
+        trial.report(val_auroc, epoch)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+    return val_auroc
+
+#Note: [I 2026-09-23 15:31:41,664] Trial 4 finished with value: 1.0 and parameters: {'lr': 2.6974156707295238e-05, 'weight_decay': 0.0005538704344804466, 'batch_size': 64}. Best is trial 4 with value: 1.0.
+
+lr = 2.6974156707295238e-05
+weight_decay = 0.0005538704344804466
+batch_size = 64
+epochs = 15
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+model = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=2)
+model = model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+for epoch in range(epochs):
+  model.train()
+  for images, labels in train_loader:
+    images, labels = images.to(device), labels.to(device)
+    optimizer.zero_grad()
+    outputs = model(images)
+    loss = criterion(outputs, labels)
+    loss.backward()
+    optimizer.step()
+
+model.eval()
+val_loss = 0.0
+correct = 0
+total = 0
+
+with torch.no_grad():
+  for images, labels in val_loader:
+    images, labels = images.to(device), labels.to(device)
+    outputs = model(images)
+    loss = criterion(outputs, labels)
+    val_loss += loss.item() * images.size(0)
+    _, predicted = torch.max(outputs.data, 1)
+    total += labels.size(0)
+    correct += (predicted == labels).sum().item()
+
+  val_loss = val_loss / len(val_loader.dataset)
+  val_accuracy = correct / total
+
+  print(f"Validation Loss: {val_loss:.4f}")
+  print(f"Validation Accuracy: {val_accuracy:.4f}")
+
+#-------------------------------------------------------
+# Save your custom weights to a file
+torch.save(model.state_dict(), "vit_custom_weights.pth")
+
+# Download it to your computer if you want to keep a copy
+from google.colab import files
+files.download("vit_custom_weights.pth")
+
+
+model = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=2)
+state_dict = torch.load("vit_custom_weights.pth", weights_only=True)
+
+model.load_state_dict(state_dict)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+model.eval()
+#--------------------------------------------------------
+
+##Now to build the langchain architecture: Lets start with defining the state:
+
+class AuditState(TypedDict, total=False):
+  case_id : str #Stable ID; used in the checkpoint thread_id
+  image_path : str # A path, not the image
+  model_key: str 
+  interactive : bool #True = pause for a human at human_review
+
+  quality: dict # Check image sharpess, brightness, arttefact/lesion fractions, problems
+  prediction: dict # classify: raw + calibrated P(melanoma), entropy, OOD details, target class
+  confidence : float #prediction confidence
+  explanations: Annotated[List, operator.add] #XAI worker: one record per attempt
+  attempt: int # 0 after first pass, 1 after 2nd pass
+  agreement: float #audit, what is the speamean correlation beteween the three method smaps
+
+  findings : list # Audit: id, check, severity, text, evidence
+  rule_status : str
+  status : str
+  llm_review : dict
+
+  reviewr : dict
+  report : str
+  
+class XAITask(TypedDict, total=False):
+  case_id : str
+  image_path : str
+  model_key : str
+  method : str
+  target : int
+  alt : bool
+  attempt : int
+
+
+class ViTAnalyser:
+
+  def __init__(self, model, transform, min_side = 224, brightness_lim=(20, 235)):
+    self.model = model
+    self.transform = transform
+    self.min_side = min_side
+    self.brightness_lim = brightness_lim
+
+  # Next gen development to consider brightness and blur boundaires but more experementation required.
+  def prepare_image(self, state: AuditState) -> dict:
+      with Image.open(state["image_path"]) as image:
+          image = ImageOps.exif_transpose(image).convert("RGB")
+          image = image.resize((224, 224), Image.Resampling.BICUBIC)
+
+          prepared_path = state["image_path"] + ".prepared.png"
+          image.save(prepared_path)
+
+      return {
+          "image_path": prepared_path,
+          "status": "ready",
+      }
+
+  def predict_image(self, state: AuditState) -> dict:
+    #We want to run our image through the prediction model
+    with Image.open(state["image_path"]) as image:
+      image = image.convert("RGB")
+      inputs = self.transform(image).unsqueeze(0) #adds batch dim
+    
+    device = next(self.model.paramters()).device
+    inputs = inputs.to(device)
+
+    self.model.eval()
+
+    outputs = self.model(inputs)
+    probs = torch.softmax(outputs, dim=1)
+
+    confidence, predictions = probs.max(dim=1)
+      
+    return {
+        "prediction": predictions.item(),
+        "confidence": confidence.item()
+    }
+    
+
+    
 
