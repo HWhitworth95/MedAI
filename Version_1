@@ -1,33 +1,32 @@
+!pip install optuna
+!pip install pytorch-ood
+
+# Standard library
 import asyncio
+import copy
 import datetime
 import operator
-from typing import Annotated, List, Literal, Optional, Union
-from typing_extensions import TypedDict
-
 import os
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-import kagglehub
-import timm
-import optuna
-import torch.optim as optim
+from typing import Annotated, List, Literal, Optional, Union
 
+# Third-party libraries
+import kagglehub
 import numpy as np
 import optuna
 import timm
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from PIL import Image, ImageOps, UnidentifiedImageError
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from typing_extensions import TypedDict
 
-mport numpy as np
-from PIL import Image, ImageOps, UnidentifiedImageError
+# Out-of-distribution detection
+from pytorch_ood.detector import EnergyBased, Mahalanobis
+from pytorch_ood.metrics import OODMetrics
 
-
-import kagglehub
 
 # Download latest version
 path = kagglehub.dataset_download("paultimothymooney/chest-xray-pneumonia")
@@ -36,7 +35,6 @@ print("Path to dataset files:", path)
 
 base_dir = os.path.join(path, "chest_xray")
 
-from torchvision import transforms
 
 # Training transforms: Mild rotation, mild scale/crop
 train_transform = transforms.Compose([
@@ -57,19 +55,15 @@ eval_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-
-
 train_dataset = datasets.ImageFolder(root=os.path.join(base_dir, "train"), transform=train_transform)
 val_dataset = datasets.ImageFolder(root=os.path.join(base_dir, "val"), transform=eval_transform)
 test_dataset = datasets.ImageFolder(root=os.path.join(base_dir, "test"), transform=eval_transform)
-
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=2)
 model = model.to(device)
 print(f"Model successfully loaded on {device}!")
 
-#MAKE SURE OPTUNA IS INSTALLED
 
 def objective(trial):
     # Hyperparameters to search
@@ -129,12 +123,11 @@ def objective(trial):
 
     return val_auroc
 
-#Note: [I 2026-09-23 15:31:41,664] Trial 4 finished with value: 1.0 and parameters: {'lr': 2.6974156707295238e-05, 'weight_decay': 0.0005538704344804466, 'batch_size': 64}. Best is trial 4 with value: 1.0.
 
 lr = 2.6974156707295238e-05
 weight_decay = 0.0005538704344804466
 batch_size = 64
-epochs = 15
+epochs = 10
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -176,24 +169,23 @@ with torch.no_grad():
   print(f"Validation Loss: {val_loss:.4f}")
   print(f"Validation Accuracy: {val_accuracy:.4f}")
 
-#-------------------------------------------------------
 # Save your custom weights to a file
 torch.save(model.state_dict(), "vit_custom_weights.pth")
 
-# Download it to your computer if you want to keep a copy
+# Download it to your computer if we want to keep a copy
 from google.colab import files
 files.download("vit_custom_weights.pth")
 
 
+import torch
+import timm
+
 model = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=2)
 state_dict = torch.load("vit_custom_weights.pth", weights_only=True)
-
 model.load_state_dict(state_dict)
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
 model.eval()
-#--------------------------------------------------------
 
 ##Now to build the langchain architecture: Lets start with defining the state:
 
@@ -203,8 +195,11 @@ class AuditState(TypedDict, total=False):
   model_key: str 
   interactive : bool #True = pause for a human at human_review
 
+
   quality: dict # Check image sharpess, brightness, arttefact/lesion fractions, problems
   prediction: dict # classify: raw + calibrated P(melanoma), entropy, OOD details, target class
+  logits : list[float]
+  ood_flag : bool = False
   confidence : float #prediction confidence
   explanations: Annotated[List, operator.add] #XAI worker: one record per attempt
   attempt: int # 0 after first pass, 1 after 2nd pass
@@ -227,14 +222,25 @@ class XAITask(TypedDict, total=False):
   alt : bool
   attempt : int
 
+#What are the nodes and functions we will need:
+'''
+Start- Status: Pending
+Node 1 - Upload Image, Check Image (Image Quality, Reshape if needed etc), If image == Bad --> Node X  - Status : Pending
+Node 2 - Classify Vit, OOD Detection - Status : Pending
+Node 3 - FOFI - XAI workers (Grad-CAM, Integrated Gradients, Occlusion) - Status : Pending (Use SEND)
+Node 4 - 
+'''
+
 
 class ViTAnalyser:
 
-  def __init__(self, model, transform, min_side = 224, brightness_lim=(20, 235)):
+  def __init__(self, model, transform,energy_threshold = 0.85, min_side = 224, brightness_lim=(20, 235)): #Energy threshold has been artibarity chosen, should probs do some testing to determine optimal values.
     self.model = model
     self.transform = transform
     self.min_side = min_side
     self.brightness_lim = brightness_lim
+    self.ood_detector = EnergyBased(model)
+    self.energy_threshold = energy_threshold
 
   # Next gen development to consider brightness and blur boundaires but more experementation required.
   def prepare_image(self, state: AuditState) -> dict:
@@ -256,7 +262,7 @@ class ViTAnalyser:
       image = image.convert("RGB")
       inputs = self.transform(image).unsqueeze(0) #adds batch dim
     
-    device = next(self.model.paramters()).device
+    device = next(self.model.parameters()).device
     inputs = inputs.to(device)
 
     self.model.eval()
@@ -268,9 +274,24 @@ class ViTAnalyser:
       
     return {
         "prediction": predictions.item(),
-        "confidence": confidence.item()
+        "confidence": confidence.item(),
+        "logits": outputs[0].tolist()
     }
     
+  def OOD_detect(self, state: AuditState) -> dict:
+    #We want to run our image through the prediction model
+    logits = torch.tensor([state["logits"]])
+    energy = self.ood_detector.predict_logits(logits).item() #Higher energy --> more uncertain
+    is_ood = energy > self.energy_threshold
+
+    return {
+        "ood_flag": is_ood,
+        "energy": energy,
+        "status": "abstain" if is_ood else state["status"]
+    }
+    
+
+
 
     
 
