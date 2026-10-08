@@ -1,4 +1,5 @@
 !pip install optuna
+!pip install langgraph langchain langchain-anthropic captum grad-cam scipy
 !pip install pytorch-ood
 
 # Standard library
@@ -27,6 +28,30 @@ from typing_extensions import TypedDict
 from pytorch_ood.detector import EnergyBased, Mahalanobis
 from pytorch_ood.metrics import OODMetrics
 
+import json
+import threading
+import uuid
+
+import torch.nn.functional as F
+from pydantic import BaseModel, Field
+from scipy.ndimage import laplace
+from scipy.stats import spearmanr
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Subset
+
+# Explainability
+from captum.attr import IntegratedGradients, Occlusion
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+# Agent framework
+from langchain.chat_models import init_chat_model
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, Send, interrupt
+
+from dotenv import load_dotenv
+load_dotenv() 
 
 # Download latest version
 path = kagglehub.dataset_download("paultimothymooney/chest-xray-pneumonia")
@@ -34,7 +59,6 @@ path = kagglehub.dataset_download("paultimothymooney/chest-xray-pneumonia")
 print("Path to dataset files:", path)
 
 base_dir = os.path.join(path, "chest_xray")
-
 
 # Training transforms: Mild rotation, mild scale/crop
 train_transform = transforms.Compose([
@@ -123,11 +147,10 @@ def objective(trial):
 
     return val_auroc
 
-
 lr = 2.6974156707295238e-05
 weight_decay = 0.0005538704344804466
 batch_size = 64
-epochs = 10
+epochs = 5
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -169,129 +192,182 @@ with torch.no_grad():
   print(f"Validation Loss: {val_loss:.4f}")
   print(f"Validation Accuracy: {val_accuracy:.4f}")
 
-# Save your custom weights to a file
+# Save custom weights to file
 torch.save(model.state_dict(), "vit_custom_weights.pth")
 
-# Download it to your computer if we want to keep a copy
 from google.colab import files
 files.download("vit_custom_weights.pth")
 
 
-import torch
-import timm
+device = torch.device("cpu")
 
-model = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=2)
-state_dict = torch.load("vit_custom_weights.pth", weights_only=True)
+model = timm.create_model(
+    "vit_base_patch16_224",
+    pretrained=False,
+    num_classes=2,
+)
+
+state_dict = torch.load(
+    "xxxxxxxxxxxxxxx", #File path goes here
+    map_location="cpu",
+    weights_only=True,
+)
+
 model.load_state_dict(state_dict)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
 model.eval()
 
-##Now to build the langchain architecture: Lets start with defining the state:
+#Define the classes for the system
 
 class AuditState(TypedDict, total=False):
-  case_id : str #Stable ID; used in the checkpoint thread_id
-  image_path : str # A path, not the image
-  model_key: str 
-  interactive : bool #True = pause for a human at human_review
+    case_id : str
+    image_path : str
+    model_key : str
+    interactive : bool #If true pause at human interrupt
 
+    quality : dict #Size brightness, sharpness any issues with the image
+    prediction : dict #Label, class name, confidence, probability
+    logits : list[float]
+    energy : float
+    ood_flag : bool
 
-  quality: dict # Check image sharpess, brightness, arttefact/lesion fractions, problems
-  prediction: dict # classify: raw + calibrated P(melanoma), entropy, OOD details, target class
-  logits : list[float]
-  ood_flag : bool = False
-  confidence : float #prediction confidence
-  explanations: Annotated[List, operator.add] #XAI worker: one record per attempt
-  attempt: int # 0 after first pass, 1 after 2nd pass
-  agreement: float #audit, what is the speamean correlation beteween the three method smaps
+    explainations: Annotated[list, operator.add]
+    findings: Annotated[list, operator.add]
+    attempt: int
+    agreement : dict #Spearham rho + mean most likely method to use
 
-  findings : list # Audit: id, check, severity, text, evidence
-  rule_status : str
-  status : str
-  llm_review : dict
+    rule_status : str # Pass/ warn/ fail
+    llm_review : dict
+    reviewer : cdict
+    status : str
+    report : str
 
-  reviewr : dict
-  report : str
-  
-class XAITask(TypedDict, total=False):
-  case_id : str
-  image_path : str
-  model_key : str
-  method : str
-  target : int
-  alt : bool
-  attempt : int
+class XAITask(TypedDict):
+    case_id : str
+    image_path : str
+    model_key : str
+    method : str
+    target : int #Class index to explan, pnumonia or benign
+    class_name : str
+    confidence : float
+    alt : bool
+    attempt : int
 
-#What are the nodes and functions we will need:
-'''
-Start- Status: Pending
-Node 1 - Upload Image, Check Image (Image Quality, Reshape if needed etc), If image == Bad --> Node X  - Status : Pending
-Node 2 - Classify Vit, OOD Detection - Status : Pending
-Node 3 - FOFI - XAI workers (Grad-CAM, Integrated Gradients, Occlusion) - Status : Pending (Use SEND)
-Node 4 - 
-'''
+#We need to calibrate the OOD detector
+@torch.no_grad()
+def collect_energies(model, loader):
+    """Energy score E(x) = -logsumexp(logits). Higher = less familiar to the model."""
+    model.eval()
+    energies = []
+    for images, _ in loader:
+        logits = model(images.to(device))
+        energies.append(-torch.logsumexp(logits, dim=1).cpu())
+    return torch.cat(energies).numpy()
 
+calib_idx, eval_idx = train_test_split(
+    list(range(len(test_dataset))), test_size=0.5,
+    stratify=test_dataset.targets, random_state=0,
+)
+calib_loader = DataLoader(Subset(test_dataset, calib_idx), batch_size=32)
+
+id_energies = collect_energies(model, calib_loader)
+ENERGY_THRESHOLD = float(np.percentile(id_energies, 95))
+print(f"Energy threshold (95th pct of in-distribution): {ENERGY_THRESHOLD:.3f}")
 
 class ViTAnalyser:
+    def __init__(self, model, transform, energy_threshold = -1.388, min_side=224, brightness_lim=(20, 235)):
+        self.model = model
+        self.transform = transform
+        self.energy_threshold = energy_threshold
+        self.min_side = min_side
+        self.brightness_lim = brightness_lim
 
-  def __init__(self, model, transform,energy_threshold = 0.85, min_side = 224, brightness_lim=(20, 235)): #Energy threshold has been artibarity chosen, should probs do some testing to determine optimal values.
-    self.model = model
-    self.transform = transform
-    self.min_side = min_side
-    self.brightness_lim = brightness_lim
-    self.ood_detector = EnergyBased(model)
-    self.energy_threshold = energy_threshold
+    def prepare_image(self, state: AuditState) -> dict:
+        try:
+            with Image.open(state["image_path"]) as image:
+                image = ImageOps.exif_transpose(image).convert("L")  #This may be redundant but using PIL might case issues w/raw image so we wnat to read meta data and rotate if needed, exif_transpose(x) should always make right side up and get rid of orientation tag. '.convert("L")' converts to greyscale, once again may be redundant but not sure.
+                arr = np.asarray(image, dtype=np.float32) #convert image to numpy 32bit array
+                w, h = image.size #Reads image height and wdith in pixels
+                quality = { # builds a dict containing width/hieght image dims which we check against imin size
+                    "width": w, "height": h,
+                    "brightness": float(arr.mean()), #avg pixel intensity, lover val --> darker image and vice versa 
+                    "sharpness": float(laplace(arr).var()),  # variance of Laplacian; low = blurry, asusme higher val means more edges therefore lower val are indicitive of blur
+                    "problems": [], # empty list but can fill with stuff like "too dark" or "too much blur" etc. useful for why image may be binned.
+                }
+                if min(w, h) < self.min_side: #if the image given is smaller than the minimum allowed then quality field 'problems' is updated with 'too small' and the assoicated dimensions.
+                    quality["problems"].append(f"too small ({w}x{h})")
+                lo, hi = self.brightness_lim #Brightness limits assigned to lo / hi
+                if not lo <= quality["brightness"] <= hi: #if image brightness falls outside acceptable ranges then it gets booted
+                    quality["problems"].append(f"brightness {quality['brightness']:.0f} outside {lo}-{hi}")
 
-  # Next gen development to consider brightness and blur boundaires but more experementation required.
-  def prepare_image(self, state: AuditState) -> dict:
-      with Image.open(state["image_path"]) as image:
-          image = ImageOps.exif_transpose(image).convert("RGB")
-          image = image.resize((224, 224), Image.Resampling.BICUBIC)
+                if quality["problems"]:
+                    return {"quality": quality, "status": "rejected_quality"} # If there are any problems then the status attribute of dict quality gets set to rejected .
 
-          prepared_path = state["image_path"] + ".prepared.png"
-          image.save(prepared_path)
+                prepared = image.convert("RGB").resize((224, 224), Image.Resampling.BICUBIC) #Convert the image to RGB format and resize to 224x24 for vit input and resample the image as it smooths the spatial transitions of positional embeddings
+                prepared_path = state["image_path"] + ".prepared.png"
+                prepared.save(prepared_path)
+        except (UnidentifiedImageError, OSError) as e:
+            return {"quality": {"problems": [f"unreadable: {e}"]}, "status": "rejected_quality"} #if image cant be read this is sent back as quality problem in to the dict.
 
-      return {
-          "image_path": prepared_path,
-          "status": "ready",
-      }
+        return {"image_path": prepared_path, "quality": quality, "status": "ready"}
 
-  def predict_image(self, state: AuditState) -> dict:
-    #We want to run our image through the prediction model
-    with Image.open(state["image_path"]) as image:
-      image = image.convert("RGB")
-      inputs = self.transform(image).unsqueeze(0) #adds batch dim
+    def predict_image(self, state: AuditState) -> dict:
+        with Image.open(state["image_path"]) as image:
+            x = self.transform(image.convert("RGB")).unsqueeze(0) #for ViT need to add another dimension at the start for batch ,so it goes from [c,h,w] to [b, c, h ,w] also converts greyscale to RGB values.
+
+        device = next(self.model.parameters()).device
+        self.model.eval() #put model in to eval mode so no dropout etc 
+        with torch.no_grad(): # inference only no autograd graph
+            logits = self.model(x.to(device))[0].cpu() #Run foward pass over the model and extract the output back to the cpu
+
+        probs = torch.softmax(logits, dim=0) #Probability for each class
+        label = int(probs.argmax()) #Output class
+        return {
+            "logits": logits.tolist(),
+            "prediction": {
+                "label": label,
+                "class_name": CLASS_NAMES[label],
+                "confidence": float(probs[label]),
+                "probs": probs.tolist(),
+            },
+            "attempt": 0,
+            "status": "predicted",
+        }
+
+    def ood_detect(self, state: AuditState) -> dict:
+        logits = torch.tensor(state["logits"])
+        energy = float(-torch.logsumexp(logits, dim=0))
+        is_ood = energy > self.energy_threshold
+        return {"energy": energy, "ood_flag": is_ood,
+                "status": "abstain" if is_ood else "in_distribution"}
+
+#The next stage is to build the functions for Grad-CAM, Integrated_Gradients and Occlusion
+
+#lets start by lodaing in the input
+def load_input(image_path):
+    with image.open(image_path) as img:
+        return eval_transaform(img).unsqueeze(0)#add batch dim at the start
+
+
+def vit_reshape(tokens, h=14, w=14):
+    patches = tokens[:, 1:, :].reshape(tokens.size(0), h, w, tokens.size(2))
+    #first token is classifier token hwich we dont need because we only care about spatial. can slice this out using tokens[:,1:,:] which should just remove first token so we kep the 196 patch tokens
+    #shape changes from [B, 197, D] to [B, 196, D] (B --> Batch Size, D --> Embedding)
+
+    #For The analyis we dont want the 196 linear data rather we want in a grid. Therefore patches.reshape(tokens.size(0), h,w, tokens.size(2))
+
+    '''
+    tokens.size(0)  # Returns 1    (Batch size)
+    tokens.size(1)  # Returns 197  (Number of tokens: 1 CLS + 196 Patches)
+    tokens.size(2)  # Returns 768  (Feature dimension size)
+    '''
     
-    device = next(self.model.parameters()).device
-    inputs = inputs.to(device)
+    return patches.permute(0, 3, 1, 2) #Shape change: From [B, 14, 14, D] → [B, D, 14, 14].
 
-    self.model.eval()
 
-    outputs = self.model(inputs)
-    probs = torch.softmax(outputs, dim=1)
-
-    confidence, predictions = probs.max(dim=1)
-      
-    return {
-        "prediction": predictions.item(),
-        "confidence": confidence.item(),
-        "logits": outputs[0].tolist()
-    }
+def run_gradcam(model, x, target): # 'model' is the trained vision transformer , 'x'is the input tensor (preprocessd) and 'target' is the ID class we want to explain
+    layer = model.blocks[-2].norm1 #Isolate the layer nomalisation inside the final transformer encoder blocks
+    with GradCAM(model=model, target_layers=[layer], reshape_transform=vit_reshape) as cam:
+        heat = cam(input_tensor=x, targets=[ClassifierOutputTarget(target)])
+    return heat[0], {}
     
-  def OOD_detect(self, state: AuditState) -> dict:
-    #We want to run our image through the prediction model
-    logits = torch.tensor([state["logits"]])
-    energy = self.ood_detector.predict_logits(logits).item() #Higher energy --> more uncertain
-    is_ood = energy > self.energy_threshold
-
-    return {
-        "ood_flag": is_ood,
-        "energy": energy,
-        "status": "abstain" if is_ood else state["status"]
-    }
-    
-
-
-
-    
-
