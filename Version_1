@@ -370,4 +370,32 @@ def run_gradcam(model, x, target): # 'model' is the trained vision transformer ,
     with GradCAM(model=model, target_layers=[layer], reshape_transform=vit_reshape) as cam:
         heat = cam(input_tensor=x, targets=[ClassifierOutputTarget(target)])
     return heat[0], {}
+
+def run_occlusion(model, x, target):
+    #Note we want to run occlusion on the probabilities not the logits so...
+    def prob_foward(inp):
+        return torch.softmax(model(inp), dim=1)
+
     
+    occlusion = Occlusion(prob_forward)
+    attr = occlusion.attribute(
+        inputs = x,
+        strides=(3,8,8),
+        target=target,
+        sliding_window_shapes=(3,15,15),
+        baselines=0
+    )
+    
+    drop_map = attr[0].abs().sum(dim=0).detach().cpu().numpy()
+
+    return attr_map, {"max_prob_drop": float(drop_map.max())}
+
+
+XAI_RUNNERS = {
+    "gradcam" : run_gradcam,
+    "integrated_gradients" : run_integrated_gradients,
+    "occlusion" : run_occlusion,
+}
+
+METHODS = list(XAI_RUNNERS)
+
