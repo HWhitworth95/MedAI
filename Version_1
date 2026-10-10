@@ -349,6 +349,14 @@ def load_input(image_path):
         return eval_transaform(img).unsqueeze(0)#add batch dim at the start
 
 
+#The next stage is to build the functions for Grad-CAM, Integrated_Gradients and Occlusion
+
+## Input loader: use your actual transform variable name.
+def load_input(image_path):
+    with Image.open(image_path) as img:
+        return eval_transform(img.convert("RGB")).unsqueeze(0)
+
+
 def vit_reshape(tokens, h=14, w=14):
     patches = tokens[:, 1:, :].reshape(tokens.size(0), h, w, tokens.size(2))
     #first token is classifier token hwich we dont need because we only care about spatial. can slice this out using tokens[:,1:,:] which should just remove first token so we kep the 196 patch tokens
@@ -371,25 +379,41 @@ def run_gradcam(model, x, target): # 'model' is the trained vision transformer ,
         heat = cam(input_tensor=x, targets=[ClassifierOutputTarget(target)])
     return heat[0], {}
 
+#next stage is to build run_integrated_gradients
+
+def run_integrated_gradients(model, x, target, steps=50):
+    baseline = torch.zeros_like(x)
+    ig = IntegratedGradients(model)
+    #Compute attributions and delta
+    attr, delta = ig.attribute(
+        inputs = x,
+        baselines=baseline,
+        target=target,
+        n_steps = steps,
+        return_convergence_delta = True
+    )
+    attr_map = attr[0].abs().sum(0).detach().cpu().numpy()    #attr[0] removes batch, .abs() gives absolute value to measure importantce of magnitude
+    #.sum(0) collapses the channels and sums the avlues over 0th axis to a 2d gird
+    #.detatch().cpu is a memory cleanup and .numpy is a format conversion to standard numpy array
+    return attr_map, {"ig_convergence_delta": float(delta.abs().item())}
+
+    
 def run_occlusion(model, x, target):
-    #Note we want to run occlusion on the probabilities not the logits so...
-    def prob_foward(inp):
+    def prob_forward(inp):
         return torch.softmax(model(inp), dim=1)
 
-    
     occlusion = Occlusion(prob_forward)
+
     attr = occlusion.attribute(
-        inputs = x,
-        strides=(3,8,8),
+        inputs=x,
+        strides=(3, 8, 8),
         target=target,
-        sliding_window_shapes=(3,15,15),
-        baselines=0
+        sliding_window_shapes=(3, 15, 15),
+        baselines=0,
     )
-    
     drop_map = attr[0].abs().sum(dim=0).detach().cpu().numpy()
 
-    return attr_map, {"max_prob_drop": float(drop_map.max())}
-
+    return drop_map, {}
 
 XAI_RUNNERS = {
     "gradcam" : run_gradcam,
@@ -399,3 +423,308 @@ XAI_RUNNERS = {
 
 METHODS = list(XAI_RUNNERS)
 
+
+'''
+The next step is to turn each saliency map into a few numbers that an analyst. There are three pieces:
+
+Normalise every map the same way, so the methods are comparable.
+Summarise each map with border fraction and top-10% fraction.
+Compare the methods pairwise with Spearman ρ.
+'''
+
+def normalise_map(m, size=224):
+    """Resize to size x size, take magnitudes, and scale so the map sums to 1."""
+    m = np.abs(np.asarray(m, dtype=np.float32))
+    if m.shape != (size, size):
+        t = torch.from_numpy(m)[None, None]                       # [1, 1, H, W] for interpolate
+        m = F.interpolate(t, size=(size, size), mode="bilinear",
+                          align_corners=False)[0, 0].numpy()
+    total = m.sum()
+    return m / total if total > 0 else m                          # ← must be outside the if
+
+
+def border_frac(m, margin=0.10):
+    """Share of attribution mass in the outer `margin` band of the image.
+    High values suggest shortcut learning (L/R markers, text, collimation edges).
+    Reference point: a uniform map gives 1 - (1 - 2*margin)^2 = 0.36 at margin=0.10."""
+    b = int(m.shape[0] * margin)
+    interior = m[b:-b, b:-b].sum()
+    return float(m.sum() - interior)
+
+
+def top_frac(m, q=0.10):
+    """Share of mass held by the top q fraction of pixels, i.e. how concentrated the map is.
+    Uniform map -> q (0.10); a sharply focused map -> close to 1."""
+    flat = np.sort(m.ravel())[::-1]
+    k = int(np.ceil(q * flat.size))
+    return float(flat[:k].sum())
+
+
+def summarise_map(m):
+    return {"border_frac": border_frac(m), "top10_frac": top_frac(m)}
+
+import base64, io
+import matplotlib
+matplotlib.use("Agg")                     # render to file, no display needed
+import matplotlib.pyplot as plt
+
+def make_overlay_panel(image_path, maps: dict) -> str:
+    """Original X-ray plus one heatmap overlay per method, returned as base64 PNG."""
+    with Image.open(image_path) as img:
+        base = np.asarray(img.convert("L").resize((224, 224)))
+
+    fig, axes = plt.subplots(1, len(maps) + 1, figsize=(4 * (len(maps) + 1), 4))
+    axes[0].imshow(base, cmap="gray"); axes[0].set_title("original")
+    for ax, (name, m) in zip(axes[1:], maps.items()):
+        ax.imshow(base, cmap="gray")
+        ax.imshow(m / m.max(), cmap="jet", alpha=0.4)   # rescale for display only
+        ax.set_title(name)
+    for ax in axes:
+        ax.axis("off")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
+
+def pooled(m, grid=14):
+    """Average-pool to the ViT patch grid (14x14). Pixel-level Spearman is dominated by
+    noise and by occlusion's blocky ties; patch level is the resolution the model actually 'sees'."""
+    t = torch.from_numpy(m)[None, None]
+    return F.adaptive_avg_pool2d(t, grid)[0, 0].numpy().ravel()
+
+
+def method_agreement(maps: dict) -> dict:
+    """Pairwise Spearman rho between methods, plus the mean."""
+    names = sorted(maps)
+    pairwise = {}
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            rho, _ = spearmanr(pooled(maps[a]), pooled(maps[b]))
+            pairwise[f"{a}_vs_{b}"] = float(rho)
+    return {"pairwise": pairwise,
+            "mean_rho": float(np.mean(list(pairwise.values())))}
+
+def dispatch_xai(state: AuditState):
+    """Fan out one XAI task per method for the predicted class."""
+    pred = state["prediction"]
+    return [Send("run_xai", XAITask(
+        case_id=state["case_id"], image_path=state["image_path"],
+        model_key=state.get("model_key", "cxr_vit"), method=method,
+        target=pred["label"], class_name=pred["class_name"],
+        confidence=pred["confidence"], alt=False, attempt=state.get("attempt", 0),
+    )) for method in METHODS]
+
+
+def run_xai(task: XAITask) -> dict:
+    x = load_input(task["image_path"]).to(device)
+    raw, extra = XAI_RUNNERS[task["method"]](model, x, task["target"])
+    m = normalise_map(raw)
+
+    # Store the map on disk rather than in state: state is checkpointed by MemorySaver,
+    # and a list of 224x224 arrays bloats every checkpoint.
+    map_path = f"{task['image_path']}.{task['method']}.a{task['attempt']}.npy"
+    np.save(map_path, m)
+
+    return {"explainations": [{
+        "method": task["method"], "attempt": task["attempt"], "target": task["target"],
+        "map_path": map_path, **summarise_map(m), **extra,
+    }]}
+
+
+def compare_methods(state: AuditState) -> dict:
+    attempt = state.get("attempt", 0)
+    current = [e for e in state["explainations"] if e["attempt"] == attempt]  # ignore earlier retries
+    maps = {e["method"]: np.load(e["map_path"]) for e in current}
+    return {"agreement": method_agreement(maps)}
+
+def llm_review(state: AuditState) -> dict:
+    evidence = build_evidence(state)
+    attempt = state.get("attempt", 0)
+    maps = {e["method"]: np.load(e["map_path"])
+            for e in state["explainations"] if e["attempt"] == attempt}
+    panel_b64 = make_overlay_panel(state["image_path"], maps)
+
+    review = reviewer_llm.invoke([
+        ("system", SYSTEM_PROMPT),
+        {"role": "user", "content": [
+            {"type": "image",
+             "source": {"type": "base64", "media_type": "image/png", "data": panel_b64}},
+            {"type": "text", "text": json.dumps(evidence, indent=2)},
+        ]},
+    ])
+    return {"llm_review": review.model_dump(), "status": "llm_reviewed"}
+
+def build_evidence(state: AuditState) -> dict:
+    """Collect only what the LLM needs: numbers and labels, no maps or file paths."""
+    attempt = state.get("attempt", 0)
+    methods = {
+        e["method"]: {k: round(v, 3) for k, v in e.items()
+                      if k in ("border_frac", "top10_frac", "ig_convergence_delta")}
+        for e in state["explainations"] if e["attempt"] == attempt
+    }
+    return {
+        "prediction": {k: state["prediction"][k] for k in ("class_name", "confidence")},
+        "energy": round(state["energy"], 3),
+        "energy_threshold": round(ENERGY_THRESHOLD, 3),
+        "image_quality": {k: state["quality"][k] for k in ("brightness", "sharpness")},
+        "methods": methods,
+        "agreement": state["agreement"],
+    }
+
+
+SYSTEM_PROMPT = """You are auditing a Vision Transformer that classifies frontal chest radiographs
+as NORMAL or PNEUMONIA. Your audience is a radiologist reviewing whether the model's
+reasoning can be trusted. Write in clinical language.
+
+You receive:
+1. An image panel: the original radiograph, then the same image with a heatmap overlay
+   for each saliency method (Grad-CAM, Integrated Gradients, Occlusion). Warm colours = more important.
+2. Supporting statistics for each method.
+
+Your primary evidence is the image panel. For each method, describe WHERE it attends in
+anatomical terms (zones, hila, cardiac silhouette, costophrenic angles, hemidiaphragms,
+chest wall, outside the thorax) and WHAT is visible there on the radiograph.
+Use radiological convention: the patient's right is on the image left.
+
+Judge clinical plausibility:
+- PNEUMONIA is plausibly supported by attention on lung parenchyma, particularly areas of
+  increased opacity or consolidation.
+- NORMAL is plausibly supported by attention spread across clear, well-aerated lung fields.
+- Implausible bases: laterality markers, text, tubes or lines, image borders, soft tissue
+  outside the thorax, or attention confined to the heart or diaphragm.
+
+How to use the statistics (supporting evidence only; cite them in brackets):
+- border_frac: attribution mass in the outer 10% band. A uniform map gives 0.36. This is a
+  reference point, not a threshold; only values well above it suggest border reliance.
+- top10_frac: mass in the top 10% of pixels. Uniform = 0.10, sharply focused = near 1.
+- zones / top_zones: mass in each of 9 chest zones (uniform = 0.111 each).
+- agreement.mean_rho: patch-level Spearman correlation between methods. Note that Grad-CAM
+  on a ViT is coarse (14x14 patches) and Integrated Gradients is often speckled, so low
+  correlation can reflect method resolution; check the overlays to see whether they
+  actually disagree about the region.
+- ig_convergence_delta: large values mean the IG attribution is numerically unreliable.
+- energy: below energy_threshold means the image resembles the training data.
+
+Describe what you see; do not make your own diagnosis. If something cannot be judged from
+the image (e.g. overlay too diffuse), say so rather than guessing."""
+
+reviewer_llm = ChatOpenAI(model="gpt-5-nano").with_structured_output(LLMReview)
+
+
+def llm_review(state: AuditState) -> dict:
+    evidence = build_evidence(state)
+    review = reviewer_llm.invoke([
+        ("system", SYSTEM_PROMPT),
+        ("human", json.dumps(evidence, indent=2)),
+    ])
+    return {"llm_review": review.model_dump(), "status": "llm_reviewed"}
+
+CLASS_NAMES = test_dataset.classes   # ['NORMAL', 'PNEUMONIA'], used inside ViTAnalyser.predict_image
+
+
+def route_quality(state: AuditState) -> str:
+    return "report" if state["status"] == "rejected_quality" else "predict_image"
+
+
+def route_ood(state: AuditState):
+    """Either abstain straight to the report, or fan out one XAI task per method.
+    A LangGraph router may return a node name OR a list of Sends."""
+    if state["ood_flag"]:
+        return "report"
+    return dispatch_xai(state)
+
+
+def human_review(state: AuditState) -> dict:
+    """Pause the graph and hand the case to a person. Resumed with Command(resume=...)."""
+    decision = interrupt({
+        "case_id": state["case_id"],
+        "prediction": state["prediction"],
+        "llm_review": state["llm_review"],
+        "question": "Accept, reject, or override the prediction? Add a note.",
+    })
+    return {"reviewer": decision, "status": "human_reviewed"}
+
+
+def report(state: AuditState) -> dict:
+    """One markdown record per case, whichever path it took."""
+    lines = [f"# Audit: {state['case_id']}", f"**Final status:** {state['status']}", ""]
+
+    problems = state.get("quality", {}).get("problems")
+    if problems:
+        lines.append("**Image rejected:** " + "; ".join(problems))
+        return {"report": "\n".join(lines)}
+
+    p = state["prediction"]
+    lines.append(f"**Prediction:** {p['class_name']} ({p['confidence']:.1%})")
+    lines.append(f"**Energy:** {state['energy']:.3f} (threshold {ENERGY_THRESHOLD:.3f})")
+
+    if state.get("ood_flag"):
+        lines.append("**Abstained:** input looks out-of-distribution; no explanation produced.")
+        return {"report": "\n".join(lines)}
+
+    lines += ["", "| Method | Border frac | Top-10% frac |", "|---|---|---|"]
+    for e in state["explainations"]:
+        lines.append(f"| {e['method']} | {e['border_frac']:.3f} | {e['top10_frac']:.3f} |")
+    lines.append(f"\n**Mean Spearman rho:** {state['agreement']['mean_rho']:.3f}")
+
+    r = state["llm_review"]
+    lines += ["", f"**LLM verdict:** {r['verdict']}", r["rationale"]]
+    lines += [f"- {c}" for c in r["concerns"]]
+
+    if state.get("reviewer"):
+        lines += ["", f"**Human reviewer:** {state['reviewer']}"]
+
+    return {"report": "\n".join(lines)}
+
+def route_after_review(state: AuditState) -> str:
+    """Send flagged cases to a human when running interactively; everything else to the report."""
+    review = state["llm_review"]
+    flagged = review["recommend_human_review"] or review["verdict"] != "supported"
+    return "human_review" if flagged and state.get("interactive") else "report"
+
+def build_audit_graph(analyser: ViTAnalyser):
+    g = StateGraph(AuditState)
+
+    g.add_node("prepare_image", analyser.prepare_image)
+    g.add_node("predict_image", analyser.predict_image)
+    g.add_node("ood_detect", analyser.ood_detect)
+    g.add_node("run_xai", run_xai)                # receives an XAITask via Send, not AuditState
+    g.add_node("compare_methods", compare_methods)
+    g.add_node("llm_review", llm_review)
+    g.add_node("human_review", human_review)
+    g.add_node("report", report)
+
+    g.add_edge(START, "prepare_image")
+    g.add_conditional_edges("prepare_image", route_quality, ["predict_image", "report"])
+    g.add_edge("predict_image", "ood_detect")
+    g.add_conditional_edges("ood_detect", route_ood, ["run_xai", "report"])
+    g.add_edge("run_xai", "compare_methods")      # waits for all three branches
+    g.add_edge("compare_methods", "llm_review")
+    g.add_conditional_edges("llm_review", route_after_review, ["human_review", "report"])
+    g.add_edge("human_review", "report")
+    g.add_edge("report", END)
+
+    return g.compile(checkpointer=MemorySaver())  # checkpointer is required for interrupt()
+
+
+analyser = ViTAnalyser(model, eval_transform, energy_threshold=ENERGY_THRESHOLD)
+audit_graph = build_audit_graph(analyser)
+IPython.display.display(IPython.display.Image(audit_graph.get_graph().draw_mermaid_png()))
+
+
+def run_case(image_path, interactive=False):
+    """Run one image through the graph with its own thread, so checkpoints don't mix."""
+    case_id = str(uuid.uuid4())[:8]
+    config = {"configurable": {"thread_id": case_id}}
+    result = audit_graph.invoke(
+        {"case_id": case_id, "image_path": image_path, "interactive": interactive}, config
+    )
+    return result, config
+
+
+img_path, true_label = test_dataset.samples[eval_idx[0]]
+result, _ = run_case(img_path)
+
+print("True label:", CLASS_NAMES[true_label])
+print(result["report"])
